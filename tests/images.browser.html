@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>typora-handy image regression tests</title>
+<style>
+  body { margin:40px; font:16px sans-serif; }
+  content { display:block; height:650px; overflow:auto; }
+  #write { min-height:1000px; padding:60px; }
+  .md-meta { display:none; }
+  .md-image { display:inline-block; }
+  .md-image > img { display:block; width:200px; height:100px; }
+  #results { white-space:pre-wrap; }
+</style>
+<content><div id="write" contenteditable="true"><p id="paragraph"></p></div></content>
+<pre id="results">RUNNING</pre>
+<script src="../image-tools.js"></script>
+<script>
+(async () => {
+  const output = document.getElementById("results");
+  const write = document.getElementById("write");
+  const paragraph = document.getElementById("paragraph");
+  const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" rx="8" fill="#1976d2"/><text x="100" y="55" text-anchor="middle" fill="white" font-size="18">Image controls</text></svg>');
+  const originalMarkdown = '![demo](images/a & b.png "A title")';
+  let current, inserted = [], checks = 0;
+  const messages = [];
+  function assert(condition, message) {
+    if (!condition) throw new Error(message);
+    checks++;
+  }
+  function parse(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    return template.content.firstElementChild;
+  }
+  function render(source = originalMarkdown) {
+    const wrapper = document.createElement("span");
+    wrapper.className = "md-image md-img-loaded";
+    wrapper.setAttribute("md-inline", source.startsWith("<img") ? "imgtag" : "image");
+    const meta = document.createElement("span");
+    meta.className = "md-meta";
+    meta.textContent = source;
+    const image = source.startsWith("<img") ? parse(source).cloneNode(false) : document.createElement("img");
+    wrapper.setAttribute("data-src", image.getAttribute("src") || "images/a & b.png");
+    // Match Typora: display a resolved image and sanitize data-* attributes,
+    // while retaining the untouched HTML source in the editing metadata.
+    for (const attr of [...image.attributes]) {
+      if (attr.name.startsWith("data-")) image.removeAttribute(attr.name);
+    }
+    image.setAttribute("src", svg);
+    if (!source.startsWith("<img")) { image.alt = "demo"; image.title = "A title"; }
+    wrapper.append(meta, image);
+    wrapper.rawText = () => meta.textContent;
+    paragraph.replaceChildren(document.createTextNode("before "), wrapper, document.createTextNode(" after"));
+    current = { wrapper, image, meta };
+    return current;
+  }
+  const editor = {
+    writingArea: write, sourceView: { inSourceMode:false },
+    insertText(html) {
+      const range = window.getSelection().getRangeAt(0);
+      assert(range.startContainer.childNodes[range.startOffset] === current.wrapper, "replacement must select exactly the image wrapper");
+      assert(range.endOffset === range.startOffset + 1, "replacement must not include adjacent text");
+      inserted.push(html);
+      render(html);
+    },
+  };
+  window.File = { editor, isLocked:false };
+  render();
+  await current.image.decode();
+  window.TyporaTintImages(editor, write);
+  const frame = document.getElementById("typora-tint-image-frame");
+  const point = element => {
+    const r = element.getBoundingClientRect();
+    return { x:r.left + r.width / 2, y:r.top + r.height / 2 };
+  };
+  function pointer(type, element, x, y, pointerId = 1) {
+    element.dispatchEvent(new PointerEvent(type, { bubbles:true, cancelable:true, button:0, pointerId, pointerType:"mouse", clientX:x, clientY:y }));
+  }
+  function select() {
+    const p = point(current.image);
+    pointer("pointerdown", current.image, p.x, p.y);
+    pointer("pointerup", current.image, p.x, p.y);
+    assert(!frame.hidden, "selecting an image must show its handles");
+  }
+  function drag(dx, dy, corner) {
+    const target = corner ? frame.querySelector(`[data-corner="${corner}"]`) : frame;
+    const p = point(target);
+    pointer("pointerdown", target, p.x, p.y);
+    pointer("pointermove", document, p.x + dx, p.y + dy);
+    pointer("pointerup", document, p.x + dx, p.y + dy);
+  }
+  const saved = () => parse(inserted[inserted.length - 1]);
+  function closeWithEscape() { document.dispatchEvent(new KeyboardEvent("keydown", {key:"Escape",bubbles:true,cancelable:true})); }
+
+  try {
+    select();
+    assert(inserted.length === 0, "clicking alone must not rewrite Markdown");
+    assert(frame.children.length === 4 && frame.querySelectorAll("[data-corner]").length === 4, "only four corner handles should be created");
+    assert(!frame.querySelector(".tint-image-toolbar") && !frame.querySelector("[data-action]"), "the image toolbar and its actions must be removed");
+    assert(frame.textContent === "", "image controls must not show a text toolbar");
+    closeWithEscape();
+    assert(frame.hidden && inserted.length === 0, "Escape should close the controls without changing the image");
+    select();
+    pointer("pointerdown", write, 1, 1);
+    assert(frame.hidden && inserted.length === 0, "clicking outside should close the controls without changing the image");
+    select();
+    drag(150, -20);
+    assert(inserted.length === 1, "one drag must produce one editor operation");
+    assert(saved().style.translate === "150px -20px", "drag must persist both axes");
+    assert(saved().getAttribute("src") === "images/a & b.png", "relative src must not become the resolved preview URL");
+    assert(saved().alt === "demo" && saved().title === "A title", "alt and title must survive Markdown conversion");
+    assert(paragraph.textContent.startsWith("before ") && paragraph.textContent.endsWith(" after"), "adjacent text must survive");
+
+    assert(!current.image.hasAttribute("data-tint-x"), "fixture must simulate Typora stripping data attributes");
+    select(); drag(20, 30);
+    assert(saved().style.translate === "170px 10px", "a second drag must accumulate the source offset");
+    render(inserted[inserted.length - 1]);
+    assert(current.image.style.translate === "170px 10px", "reopening saved HTML must restore position");
+
+    select(); drag(100, 50, "se");
+    assert(saved().style.width === "300px" && saved().style.height === "150px", "corner resize must preserve the original aspect ratio");
+    assert(saved().style.translate === "170px 10px", "southeast resize must anchor the top-left corner");
+    select(); drag(-100, -50, "nw");
+    assert(saved().style.width === "400px" && saved().style.height === "200px", "northwest resize must scale proportionally");
+    assert(saved().dataset.tintX === "70" && saved().dataset.tintY === "-40", "northwest resize must keep the opposite corner fixed");
+
+    for (const [corner, dx, dy, x, y] of [["ne",100,-50,0,-50], ["sw",-100,50,-100,0]]) {
+      render(); select(); drag(dx, dy, corner);
+      assert(saved().style.width === "300px" && saved().style.height === "150px", `${corner} resize must preserve aspect ratio`);
+      assert(Number(saved().dataset.tintX) === x && Number(saved().dataset.tintY) === y, `${corner} resize must anchor the opposite corner`);
+    }
+
+    select();
+    const beforeEscape = inserted.length;
+    const oldStyle = current.image.getAttribute("style");
+    let p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 80, p.y + 70);
+    closeWithEscape();
+    pointer("pointerup", document, p.x + 80, p.y + 70);
+    assert(inserted.length === beforeEscape, "Escape must cancel without saving");
+    assert(current.image.getAttribute("style") === oldStyle, "Escape must restore the exact previous style");
+
+    p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 50, p.y + 50);
+    pointer("pointercancel", document, p.x + 50, p.y + 50);
+    assert(inserted.length === beforeEscape && frame.hidden, "pointer cancellation must not save a preview");
+
+    select();
+    p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 40, p.y + 20);
+    pointer("pointerdown", current.image, p.x, p.y, 2);
+    pointer("pointercancel", document, p.x, p.y, 2);
+    pointer("pointerup", document, p.x + 40, p.y + 20);
+    assert(inserted.length === beforeEscape + 1, "a second pointer must not replace or cancel the active gesture");
+    select();
+    const beforeBlur = inserted.length;
+    const styleBeforeBlur = current.image.getAttribute("style");
+    p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 40, p.y + 20);
+    window.dispatchEvent(new Event("blur"));
+    pointer("pointerup", document, p.x + 40, p.y + 20);
+    assert(inserted.length === beforeBlur && current.image.getAttribute("style") === styleBeforeBlur, "losing focus must cancel the preview");
+
+    select(); drag(-10000, -10000, "se");
+    assert(Number.parseFloat(saved().style.height) >= 24, "shrinking must not produce a zero/negative image size");
+    assert(Number.parseFloat(saved().style.width) === 2 * Number.parseFloat(saved().style.height), "minimum size must preserve aspect ratio");
+    render();
+
+    select();
+    const beforeStale = inserted.length;
+    p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 50, p.y + 50);
+    current.meta.textContent += "changed";
+    pointer("pointerup", document, p.x + 50, p.y + 50);
+    assert(inserted.length === beforeStale, "a stale image source must never be overwritten");
+
+    render(); select();
+    p = point(frame);
+    pointer("pointerdown", frame, p.x, p.y);
+    pointer("pointermove", document, p.x + 50, p.y + 50);
+    window.File.isLocked = true;
+    pointer("pointerup", document, p.x + 50, p.y + 50);
+    assert(inserted.length === beforeStale, "a document locked mid-drag must not be modified");
+    window.File.isLocked = false;
+    editor.sourceView.inSourceMode = true;
+    frame.hidden = true;
+    p = point(current.image);
+    pointer("pointerdown", current.image, p.x, p.y);
+    assert(frame.hidden, "source mode must not activate image controls");
+    editor.sourceView.inSourceMode = false;
+
+    const styled = '<img src="relative.png" alt="original" title="Keep me" style="border: 1px solid red; width: 240px; height: 120px;">';
+    render(styled); select(); drag(40, 20);
+    assert(saved().style.border === "1px solid red", "unrelated HTML styles must survive");
+    assert(saved().title === "Keep me", "adjusting an HTML image must preserve its title");
+    window.TyporaTintImages(editor, write);
+    assert(document.querySelectorAll("#typora-tint-image-frame").length === 1, "initialization must be idempotent");
+
+    render(); select();
+    messages.push(`PASS: ${checks} browser assertions. No toolbar, corner handles, drag, proportional resize, persistence, reload, cancellation, sanitization, source paths, stale/locked protection.`);
+    output.textContent = messages.join("\n");
+    output.dataset.status = "pass";
+  } catch (error) {
+    output.textContent = "FAIL: " + error.stack;
+    output.dataset.status = "fail";
+  }
+})();
+</script>
+</html>
